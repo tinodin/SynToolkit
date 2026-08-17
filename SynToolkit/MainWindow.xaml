@@ -126,6 +126,11 @@
                         <ImageIcon Source="ms-appx:///assets/Icons/Applications.png" />
                     </NavigationViewItem.Icon>
                 </NavigationViewItem>
+                <NavigationViewItem x:Name="Installers" Tag="SynToolkit.Views.InstallersPage">
+                    <NavigationViewItem.Icon>
+                        <ImageIcon Source="ms-appx:///assets/Icons/Installer.png" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
                 <NavigationViewItem x:Name="PowerPlans" Tag="SynToolkit.Views.PowerPlansPage">
                     <NavigationViewItem.Icon>
                         <ImageIcon Source="ms-appx:///assets/Icons/Power.png" />
@@ -209,7 +214,7 @@
                 </NavigationViewItem>
                 <NavigationViewItem x:Name="Troubleshooting" Tag="Troubleshooting">
                     <NavigationViewItem.Icon>
-                        <ImageIcon Source="ms-appx:///assets/Icons/troubleshooting.png" />
+                        <ImageIcon Source="ms-appx:///assets/Icons/Restoration.png" />
                     </NavigationViewItem.Icon>
                     <StackPanel Orientation="Horizontal" Spacing="8">
                         <TextBlock x:Name="TroubleshootingText" VerticalAlignment="Center" />

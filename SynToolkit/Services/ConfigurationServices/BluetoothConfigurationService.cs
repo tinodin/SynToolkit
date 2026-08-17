@@ -1,167 +1,198 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Win32;
 using SynToolkit.Stores;
 using SynToolkit.Utils;
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.ServiceProcess;
 
 namespace SynToolkit.Services.ConfigurationServices
 {
-    public class BluetoothConfigurationService : IConfigurationService
+    /// <summary>
+    /// Bluetooth services toggle matching SynergyOS Disable Bluetooth / Enable Bluetooth scripts.
+    /// </summary>
+    public sealed class BluetoothConfigurationService : IConfigurationService
     {
-        private const string BLUETOOTH_SUPPORT_SERVICE_NAME = "bthserv";
-        private const string SYNTOOLKIT_STORE_KEY_NAME = @"HKLM\SOFTWARE\SynToolkit\Services\Bluetooth";
-        private const string SNAPSHOT_PRESENT_VALUE_NAME = "SnapshotPresent";
-        private const string PREVIOUS_START_MODE_VALUE_NAME = "PreviousStartMode";
-        private const string PREVIOUS_RUNNING_VALUE_NAME = "PreviousRunning";
-        private const string PREVIOUS_DELAYED_AUTO_START_VALUE_NAME = "PreviousDelayedAutoStart";
+        private const string SynToolkitStoreKey = @"HKLM\SOFTWARE\SynToolkit\Services\Bluetooth";
 
-        private readonly ConfigurationStore _bluetoothConfigurationStore;
+        // SynergyOS 2. Configuration\Bluetooth\*.bat
+        private static readonly string[] ServiceNames =
+        {
+            "BTAGService",
+            "bthserv",
+            "BthAvctpSvc",
+            "NaturalAuthentication",
+            "BluetoothUserService"
+        };
+
+        private readonly ConfigurationStore _configurationStore;
 
         public BluetoothConfigurationService(
-            [FromKeyedServices("Bluetooth")] ConfigurationStore bluetoothConfigurationStore)
+            [FromKeyedServices("Bluetooth")] ConfigurationStore configurationStore)
         {
-            _bluetoothConfigurationStore = bluetoothConfigurationStore;
+            _configurationStore = configurationStore;
         }
 
         public void Disable()
         {
-            CaptureOriginalState();
-            ServiceHelper.SetStartupType(BLUETOOTH_SUPPORT_SERVICE_NAME, ServiceStartMode.Disabled);
-            StopServiceIfRunning(BLUETOOTH_SUPPORT_SERVICE_NAME);
-            UpdateDetectedState(expectedState: false);
+            IReadOnlyList<string> installedServices = GetInstalledServices();
+            EnsureAnyServiceIsInstalled(installedServices);
+
+            foreach (string serviceName in installedServices)
+            {
+                CaptureOriginalState(serviceName);
+            }
+
+            foreach (string serviceName in installedServices)
+            {
+                ServiceHelper.SetStartupType(serviceName, ServiceStartMode.Disabled);
+                ServiceHelper.StopService(serviceName, TimeSpan.FromSeconds(15));
+            }
+
+            _configurationStore.CurrentSetting = IsEnabled();
         }
 
         public void Enable()
         {
-            ServiceStartMode restoreMode = ServiceStartMode.Manual;
-            bool restoreRunning = false;
-            bool hasSnapshot = RegistryHelper.IsMatch(
-                SYNTOOLKIT_STORE_KEY_NAME,
-                SNAPSHOT_PRESENT_VALUE_NAME,
-                1);
+            IReadOnlyList<string> installedServices = GetInstalledServices();
+            EnsureAnyServiceIsInstalled(installedServices);
 
-            if (hasSnapshot)
+            Dictionary<string, ServiceSnapshot> restoreStates = installedServices.ToDictionary(
+                serviceName => serviceName,
+                ReadSnapshotOrDefault,
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach ((string serviceName, ServiceSnapshot snapshot) in restoreStates)
             {
-                object storedMode = RegistryHelper.GetValue(
-                    SYNTOOLKIT_STORE_KEY_NAME,
-                    PREVIOUS_START_MODE_VALUE_NAME);
-                if (storedMode is not int modeValue || !Enum.IsDefined(typeof(ServiceStartMode), modeValue))
+                ServiceHelper.SetStartupType(serviceName, snapshot.StartMode);
+                if (snapshot.StartMode == ServiceStartMode.Automatic)
                 {
-                    throw new InvalidOperationException(
-                        "The saved Bluetooth service state is invalid. No changes were made.");
+                    ServiceHelper.SetDelayedAutoStart(serviceName, snapshot.DelayedAutoStart);
                 }
 
-                restoreMode = (ServiceStartMode)modeValue;
-                restoreRunning = RegistryHelper.IsMatch(
-                    SYNTOOLKIT_STORE_KEY_NAME,
-                    PREVIOUS_RUNNING_VALUE_NAME,
-                    1);
+                if (snapshot.WasRunning && snapshot.StartMode != ServiceStartMode.Disabled)
+                {
+                    ServiceHelper.StartService(serviceName, TimeSpan.FromSeconds(15));
+                }
             }
 
-            bool restoreDelayedAutoStart = restoreMode == ServiceStartMode.Automatic &&
-                RegistryHelper.IsMatch(
-                    SYNTOOLKIT_STORE_KEY_NAME,
-                    PREVIOUS_DELAYED_AUTO_START_VALUE_NAME,
-                    1);
-
-            // Manual is the Windows 11 fallback when no SynToolkit snapshot exists.
-            ServiceHelper.SetStartupType(BLUETOOTH_SUPPORT_SERVICE_NAME, restoreMode);
-            if (restoreMode == ServiceStartMode.Automatic)
+            foreach (string serviceName in installedServices)
             {
-                ServiceHelper.SetDelayedAutoStart(BLUETOOTH_SUPPORT_SERVICE_NAME, restoreDelayedAutoStart);
-            }
-            if (restoreRunning && restoreMode != ServiceStartMode.Disabled)
-            {
-                ServiceHelper.StartService(BLUETOOTH_SUPPORT_SERVICE_NAME, TimeSpan.FromSeconds(15));
+                ClearSnapshot(serviceName);
             }
 
-            UpdateDetectedState(expectedState: restoreMode != ServiceStartMode.Disabled);
-            if (hasSnapshot)
-            {
-                ClearOriginalState();
-            }
+            _configurationStore.CurrentSetting = IsEnabled();
         }
 
         public bool IsEnabled()
         {
-            return ServiceHelper.GetStartupType(BLUETOOTH_SUPPORT_SERVICE_NAME) != ServiceStartMode.Disabled;
+            IReadOnlyList<string> installedServices = GetInstalledServices();
+            EnsureAnyServiceIsInstalled(installedServices);
+            return installedServices.All(serviceName =>
+                ServiceHelper.TryGetStartupType(serviceName, out ServiceStartMode startMode) &&
+                startMode != ServiceStartMode.Disabled);
         }
 
-        private void UpdateDetectedState(bool expectedState)
-        {
-            bool detectedState = IsEnabled();
-            _bluetoothConfigurationStore.CurrentSetting = detectedState;
+        private static IReadOnlyList<string> GetInstalledServices() =>
+            ServiceNames.Where(ServiceHelper.ServiceExists).ToArray();
 
-            if (detectedState != expectedState)
+        private static void EnsureAnyServiceIsInstalled(IReadOnlyCollection<string> installedServices)
+        {
+            if (installedServices.Count == 0)
             {
-                throw new InvalidOperationException("Windows did not accept the requested Bluetooth service state.");
+                throw new InvalidOperationException(
+                    "No supported Windows Bluetooth services are installed on this computer.");
             }
         }
 
-        private static void CaptureOriginalState()
+        private static void CaptureOriginalState(string serviceName)
         {
-            if (RegistryHelper.IsMatch(
-                SYNTOOLKIT_STORE_KEY_NAME,
-                SNAPSHOT_PRESENT_VALUE_NAME,
-                1))
+            if (HasSnapshot(serviceName))
             {
                 return;
             }
 
-            ServiceStartMode startupType = ServiceHelper.GetStartupType(BLUETOOTH_SUPPORT_SERVICE_NAME);
-            bool delayedAutoStart = startupType == ServiceStartMode.Automatic &&
-                ServiceHelper.GetDelayedAutoStart(BLUETOOTH_SUPPORT_SERVICE_NAME);
-            bool wasRunning = ServiceHelper.TryGetStatus(
-                BLUETOOTH_SUPPORT_SERVICE_NAME,
-                out ServiceControllerStatus status) &&
+            ServiceStartMode startMode = ServiceHelper.GetStartupType(serviceName);
+            bool delayedAutoStart = startMode == ServiceStartMode.Automatic &&
+                ServiceHelper.GetDelayedAutoStart(serviceName);
+            bool wasRunning = ServiceHelper.TryGetStatus(serviceName, out ServiceControllerStatus status) &&
                 status == ServiceControllerStatus.Running;
 
             RegistryHelper.SetValue(
-                SYNTOOLKIT_STORE_KEY_NAME,
-                PREVIOUS_START_MODE_VALUE_NAME,
-                (int)startupType,
-                Microsoft.Win32.RegistryValueKind.DWord);
+                SynToolkitStoreKey,
+                SnapshotStartModeValue(serviceName),
+                (int)startMode,
+                RegistryValueKind.DWord);
             RegistryHelper.SetValue(
-                SYNTOOLKIT_STORE_KEY_NAME,
-                PREVIOUS_RUNNING_VALUE_NAME,
+                SynToolkitStoreKey,
+                SnapshotWasRunningValue(serviceName),
                 wasRunning ? 1 : 0,
-                Microsoft.Win32.RegistryValueKind.DWord);
+                RegistryValueKind.DWord);
             RegistryHelper.SetValue(
-                SYNTOOLKIT_STORE_KEY_NAME,
-                PREVIOUS_DELAYED_AUTO_START_VALUE_NAME,
+                SynToolkitStoreKey,
+                SnapshotDelayedAutoStartValue(serviceName),
                 delayedAutoStart ? 1 : 0,
-                Microsoft.Win32.RegistryValueKind.DWord);
+                RegistryValueKind.DWord);
             RegistryHelper.SetValue(
-                SYNTOOLKIT_STORE_KEY_NAME,
-                SNAPSHOT_PRESENT_VALUE_NAME,
+                SynToolkitStoreKey,
+                SnapshotPresentValue(serviceName),
                 1,
-                Microsoft.Win32.RegistryValueKind.DWord);
+                RegistryValueKind.DWord);
         }
 
-        private static void ClearOriginalState()
+        private static ServiceSnapshot ReadSnapshotOrDefault(string serviceName)
         {
-            RegistryHelper.DeleteValue(SYNTOOLKIT_STORE_KEY_NAME, SNAPSHOT_PRESENT_VALUE_NAME);
-            RegistryHelper.DeleteValue(SYNTOOLKIT_STORE_KEY_NAME, PREVIOUS_START_MODE_VALUE_NAME);
-            RegistryHelper.DeleteValue(SYNTOOLKIT_STORE_KEY_NAME, PREVIOUS_RUNNING_VALUE_NAME);
-            RegistryHelper.DeleteValue(SYNTOOLKIT_STORE_KEY_NAME, PREVIOUS_DELAYED_AUTO_START_VALUE_NAME);
-        }
-
-        private static void StopServiceIfRunning(string serviceName)
-        {
-            using ServiceController controller = new(serviceName);
-            controller.Refresh();
-
-            if (controller.Status is ServiceControllerStatus.Stopped)
+            if (!HasSnapshot(serviceName))
             {
-                return;
+                // SynergyOS Enable Bluetooth sets Start=2 (Automatic).
+                return new ServiceSnapshot(ServiceStartMode.Automatic, false, false);
             }
 
-            if (controller.Status is not ServiceControllerStatus.StopPending)
+            object storedMode = RegistryHelper.GetValue(
+                SynToolkitStoreKey,
+                SnapshotStartModeValue(serviceName));
+            if (storedMode is not int modeValue || !Enum.IsDefined(typeof(ServiceStartMode), modeValue))
             {
-                controller.Stop();
+                throw new InvalidOperationException(
+                    $"The saved state for Bluetooth service '{serviceName}' is invalid. No services were restored.");
             }
 
-            controller.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(15));
+            return new ServiceSnapshot(
+                (ServiceStartMode)modeValue,
+                RegistryHelper.IsMatch(
+                    SynToolkitStoreKey,
+                    SnapshotWasRunningValue(serviceName),
+                    1),
+                (ServiceStartMode)modeValue == ServiceStartMode.Automatic &&
+                    RegistryHelper.IsMatch(
+                        SynToolkitStoreKey,
+                        SnapshotDelayedAutoStartValue(serviceName),
+                        1));
         }
+
+        private static bool HasSnapshot(string serviceName) =>
+            RegistryHelper.IsMatch(
+                SynToolkitStoreKey,
+                SnapshotPresentValue(serviceName),
+                1);
+
+        private static void ClearSnapshot(string serviceName)
+        {
+            RegistryHelper.DeleteValue(SynToolkitStoreKey, SnapshotPresentValue(serviceName));
+            RegistryHelper.DeleteValue(SynToolkitStoreKey, SnapshotStartModeValue(serviceName));
+            RegistryHelper.DeleteValue(SynToolkitStoreKey, SnapshotWasRunningValue(serviceName));
+            RegistryHelper.DeleteValue(SynToolkitStoreKey, SnapshotDelayedAutoStartValue(serviceName));
+        }
+
+        private static string SnapshotPresentValue(string serviceName) => $"{serviceName}_SnapshotPresent";
+        private static string SnapshotStartModeValue(string serviceName) => $"{serviceName}_StartMode";
+        private static string SnapshotWasRunningValue(string serviceName) => $"{serviceName}_WasRunning";
+        private static string SnapshotDelayedAutoStartValue(string serviceName) => $"{serviceName}_DelayedAutoStart";
+
+        private sealed record ServiceSnapshot(
+            ServiceStartMode StartMode,
+            bool WasRunning,
+            bool DelayedAutoStart);
     }
 }
